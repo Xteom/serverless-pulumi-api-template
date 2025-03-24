@@ -1,0 +1,95 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+  build-and-push:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push Docker images
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ secrets.REPO_NAME }}
+          API_NAME: ${{ secrets.API_NAME }}
+        run: |
+          # Read function names from a config file or environment
+          FUNCTIONS=("api-${API_NAME}-authorizer" "api-${API_NAME}-get-items" "api-${API_NAME}-create-item" "api-${API_NAME}-update-item")
+          
+          for func in "${FUNCTIONS[@]}"
+          do
+            echo "Building image for $func..."
+            docker build \
+              --build-arg FUNCTION_NAME=${func#api-${API_NAME}-} \
+              -t $ECR_REGISTRY/$ECR_REPOSITORY:$func \
+              -f docker/lambda.dockerfile .
+              
+            echo "Pushing image for $func..."
+            docker push $ECR_REGISTRY/$ECR_REPOSITORY:$func
+          done
+
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Build deployment image
+        run: |
+          docker build -t deploy-infra -f docker/deploy.dockerfile .
+
+      - name: Deploy infrastructure
+        run: |
+          docker run \
+            -e AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }} \
+            -e AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }} \
+            -e AWS_REGION=${{ env.AWS_REGION }} \
+            -e AWS_ACCOUNT_ID=${{ secrets.AWS_ACCOUNT_ID }} \
+            -e PULUMI_ACCESS_TOKEN=${{ secrets.PULUMI_ACCESS_TOKEN }} \
+            -e PULUMI_CONFIG_PASSPHRASE=${{ secrets.PULUMI_CONFIG_PASSPHRASE }} \
+            -e API_NAME=${{ secrets.API_NAME }} \
+            -e PULUMI_STATE_BUCKET=${{ secrets.PULUMI_STATE_BUCKET }} \
+            -e USE_AUTOMATION_API=true \
+            deploy-infra
